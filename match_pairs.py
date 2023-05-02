@@ -58,8 +58,89 @@ from models.utils import (compute_pose_error, compute_epipolar_error,
                           error_colormap, AverageTimer, pose_auc, read_image,
                           rotate_intrinsics, rotate_pose_inplane,
                           scale_intrinsics)
+from torch.utils.data import DataLoader
 
 torch.set_grad_enabled(False)
+
+
+from torch.utils.data import Dataset
+class ImagePairDataset(Dataset):
+    def __init__(self, input_pairs, max_length, shuffle, eval, opt, timer, dataset):
+        # read the input pairs file
+        with open(input_pairs, 'r') as f:
+            self.pairs = [l.split() for l in f.readlines()]
+
+        if max_length > -1:
+            pairs = pairs[0:np.min([len(pairs), max_length])]
+
+        if shuffle:
+            random.Random(0).shuffle(pairs)
+
+        if eval:
+            if not all([len(p) == 38 for p in pairs]):
+                raise ValueError(
+                    'All pairs should have ground truth info for evaluation.'
+                    'File \"{}\" needs 38 valid entries per row'.format(input_pairs))
+        # Create the output directories if they do not exist already.
+        input_dir = Path(opt.input_dir)
+        print('Looking for data in directory \"{}\"'.format(input_dir))
+        output_dir = Path(opt.output_dir)
+        output_dir.mkdir(exist_ok=True, parents=True)
+        print('Will write matches to directory \"{}\"'.format(output_dir))
+        if opt.eval:
+            print('Will write evaluation results',
+                'to directory \"{}\"'.format(output_dir))
+        if opt.viz:
+            print('Will write visualization images to',
+                'directory \"{}\"'.format(output_dir))
+        # store arguments
+        self.input_dir = input_dir
+        self.output_dir = output_dir
+        self.opt = opt
+        self.timer = timer
+        self.device = device
+
+    def __getitem__(self, index):
+        opt = self.opt
+        pair = self.pairs[index]
+        name0, name1 = pair[:2]
+        stem0, stem1 = Path(name0).stem, Path(name1).stem
+        matches_path = self.output_dir / '{}_{}_matches.npz'.format(stem0, stem1)
+        eval_path = self.output_dir / '{}_{}_evaluation.npz'.format(stem0, stem1)
+        viz_path = self.output_dir / '{}_{}_matches.{}'.format(stem0, stem1, opt.viz_extension)
+        viz_eval_path = self.output_dir / \
+            '{}_{}_evaluation.{}'.format(stem0, stem1, opt.viz_extension)
+
+        # Handle --cache logic.
+        do_match = True
+        do_eval = opt.eval
+        do_viz = opt.viz
+        do_viz_eval = opt.eval and opt.viz
+
+        if not (do_match or do_eval or do_viz or do_viz_eval):
+            self.timer.print('Finished pair {:5} of {:5}'.format(i, len(pairs)))
+
+        # If a rotation integer is provided (e.g. from EXIF data), use it:
+        if len(pair) >= 5:
+            rot0, rot1 = int(pair[2]), int(pair[3])
+        else:
+            rot0, rot1 = 0, 0
+
+        # Load the image pair.
+        image0, inp0, scales0 = read_image(
+            self.input_dir / name0, self.device, opt.resize, rot0, opt.resize_float)
+        image1, inp1, scales1 = read_image(
+            self.input_dir / name1, self.device, opt.resize, rot1, opt.resize_float)
+        if image0 is None or image1 is None:
+            print('Problem reading image pair: {} {}'.format(
+                self.input_dir/name0, self.input_dir/name1))
+            exit(1)
+        self.timer.update('load_image')
+        return {'image0': inp0, 'image1': inp1}, pair, image0, scales0, image1, scales1
+        # return self.pairs[index]
+
+    def __len__(self):
+        return len(self.pairs)
 
 
 if __name__ == '__main__':
@@ -74,7 +155,7 @@ if __name__ == '__main__':
         '--input_dir', type=str, default='assets/scannet_sample_images/',
         help='Path to the directory that contains the images')
     parser.add_argument(
-        '--output_dir', type=str, default='dump_match_pairs/',
+        '--output_dir', type=str, default='dump_match_pairs_bs4/',
         help='Path to the directory in which the .npz results and optionally,'
              'the visualization images are written')
 
@@ -140,6 +221,13 @@ if __name__ == '__main__':
         '--force_cpu', action='store_true',
         help='Force pytorch to run in CPU mode.')
 
+    parser.add_argument(
+        '--batch_size', type=int, default=4,
+        help='size of image pairs batch')
+    parser.add_argument(
+        '--num_workers', type=int, default=4,
+        help='threads number of dataload')
+
     opt = parser.parse_args()
     print(opt)
 
@@ -159,21 +247,6 @@ if __name__ == '__main__':
         print('Will not resize images')
     else:
         raise ValueError('Cannot specify more than two integers for --resize')
-
-    with open(opt.input_pairs, 'r') as f:
-        pairs = [l.split() for l in f.readlines()]
-
-    if opt.max_length > -1:
-        pairs = pairs[0:np.min([len(pairs), opt.max_length])]
-
-    if opt.shuffle:
-        random.Random(0).shuffle(pairs)
-
-    if opt.eval:
-        if not all([len(p) == 38 for p in pairs]):
-            raise ValueError(
-                'All pairs should have ground truth info for evaluation.'
-                'File \"{}\" needs 38 valid entries per row'.format(opt.input_pairs))
 
     # Load the SuperPoint and SuperGlue models.
     device = 'cuda' if torch.cuda.is_available() and not opt.force_cpu else 'cpu'
@@ -206,73 +279,39 @@ if __name__ == '__main__':
               'directory \"{}\"'.format(output_dir))
 
     timer = AverageTimer(newline=True)
-    for i, pair in enumerate(pairs):
-        name0, name1 = pair[:2]
-        stem0, stem1 = Path(name0).stem, Path(name1).stem
-        matches_path = output_dir / '{}_{}_matches.npz'.format(stem0, stem1)
-        eval_path = output_dir / '{}_{}_evaluation.npz'.format(stem0, stem1)
-        viz_path = output_dir / '{}_{}_matches.{}'.format(stem0, stem1, opt.viz_extension)
-        viz_eval_path = output_dir / \
+
+    torch.multiprocessing.set_start_method('spawn')
+    dataset = ImagePairDataset(opt.input_pairs, opt.max_length, opt.shuffle, opt.eval, opt, timer, device)
+    dataloader = DataLoader(dataset, batch_size=opt.batch_size, num_workers=opt.num_workers)
+    for data, pairs, image0s, scales0s, image1s, scales1s in dataloader:
+        do_match = True
+        if do_match:
+            preds = matching(data)
+            
+        for i in range(len(pairs[0])):
+            pair = [p[i] for p in pairs]
+            image0, scales0 = image0s[i], [scale[i] for scale in scales0s] 
+            image1, scales1 = image1s[i], [scale[i] for scale in scales1s]
+            name0, name1 = pair[:2]
+            stem0, stem1 = Path(name0).stem, Path(name1).stem
+            matches_path = output_dir / '{}_{}_matches.npz'.format(stem0, stem1)
+            eval_path = output_dir / '{}_{}_evaluation.npz'.format(stem0, stem1)
+            viz_path = output_dir / '{}_{}_matches.{}'.format(stem0, stem1, opt.viz_extension)
+            viz_eval_path = output_dir / \
             '{}_{}_evaluation.{}'.format(stem0, stem1, opt.viz_extension)
 
-        # Handle --cache logic.
-        do_match = True
-        do_eval = opt.eval
-        do_viz = opt.viz
-        do_viz_eval = opt.eval and opt.viz
-        if opt.cache:
-            if matches_path.exists():
-                try:
-                    results = np.load(matches_path)
-                except:
-                    raise IOError('Cannot load matches .npz file: %s' %
-                                  matches_path)
+            # Handle --cache logic.
+            do_match = True
+            do_eval = opt.eval
+            do_viz = opt.viz
+            do_viz_eval = opt.eval and opt.viz
 
-                kpts0, kpts1 = results['keypoints0'], results['keypoints1']
-                matches, conf = results['matches'], results['match_confidence']
-                do_match = False
-            if opt.eval and eval_path.exists():
-                try:
-                    results = np.load(eval_path)
-                except:
-                    raise IOError('Cannot load eval .npz file: %s' % eval_path)
-                err_R, err_t = results['error_R'], results['error_t']
-                precision = results['precision']
-                matching_score = results['matching_score']
-                num_correct = results['num_correct']
-                epi_errs = results['epipolar_errors']
-                do_eval = False
-            if opt.viz and viz_path.exists():
-                do_viz = False
-            if opt.viz and opt.eval and viz_eval_path.exists():
-                do_viz_eval = False
-            timer.update('load_cache')
+            if len(pair) >= 5:
+                rot0, rot1 = int(pair[2]), int(pair[3])
+            else:
+                rot0, rot1 = 0, 0
 
-        if not (do_match or do_eval or do_viz or do_viz_eval):
-            timer.print('Finished pair {:5} of {:5}'.format(i, len(pairs)))
-            continue
-
-        # If a rotation integer is provided (e.g. from EXIF data), use it:
-        if len(pair) >= 5:
-            rot0, rot1 = int(pair[2]), int(pair[3])
-        else:
-            rot0, rot1 = 0, 0
-
-        # Load the image pair.
-        image0, inp0, scales0 = read_image(
-            input_dir / name0, device, opt.resize, rot0, opt.resize_float)
-        image1, inp1, scales1 = read_image(
-            input_dir / name1, device, opt.resize, rot1, opt.resize_float)
-        if image0 is None or image1 is None:
-            print('Problem reading image pair: {} {}'.format(
-                input_dir/name0, input_dir/name1))
-            exit(1)
-        timer.update('load_image')
-
-        if do_match:
-            # Perform the matching.
-            pred = matching({'image0': inp0, 'image1': inp1})
-            pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
+            pred = {k: v[i].cpu().numpy() for k, v in preds.items()}
             kpts0, kpts1 = pred['keypoints0'], pred['keypoints1']
             matches, conf = pred['matches0'], pred['matching_scores0']
             timer.update('matcher')
@@ -282,122 +321,122 @@ if __name__ == '__main__':
                            'matches': matches, 'match_confidence': conf}
             np.savez(str(matches_path), **out_matches)
 
-        # Keep the matching keypoints.
-        valid = matches > -1
-        mkpts0 = kpts0[valid]
-        mkpts1 = kpts1[matches[valid]]
-        mconf = conf[valid]
+            # Keep the matching keypoints.
+            valid = matches > -1
+            mkpts0 = kpts0[valid]
+            mkpts1 = kpts1[matches[valid]]
+            mconf = conf[valid]
 
-        if do_eval:
-            # Estimate the pose and compute the pose error.
-            assert len(pair) == 38, 'Pair does not have ground truth info'
-            K0 = np.array(pair[4:13]).astype(float).reshape(3, 3)
-            K1 = np.array(pair[13:22]).astype(float).reshape(3, 3)
-            T_0to1 = np.array(pair[22:]).astype(float).reshape(4, 4)
+            if do_eval:
+                # Estimate the pose and compute the pose error.
+                assert len(pair) == 38, 'Pair does not have ground truth info'
+                K0 = np.array(pair[4:13]).astype(float).reshape(3, 3)
+                K1 = np.array(pair[13:22]).astype(float).reshape(3, 3)
+                T_0to1 = np.array(pair[22:]).astype(float).reshape(4, 4)
 
-            # Scale the intrinsics to resized image.
-            K0 = scale_intrinsics(K0, scales0)
-            K1 = scale_intrinsics(K1, scales1)
+                # Scale the intrinsics to resized image.
+                K0 = scale_intrinsics(K0, scales0)
+                K1 = scale_intrinsics(K1, scales1)
 
-            # Update the intrinsics + extrinsics if EXIF rotation was found.
-            if rot0 != 0 or rot1 != 0:
-                cam0_T_w = np.eye(4)
-                cam1_T_w = T_0to1
-                if rot0 != 0:
-                    K0 = rotate_intrinsics(K0, image0.shape, rot0)
-                    cam0_T_w = rotate_pose_inplane(cam0_T_w, rot0)
-                if rot1 != 0:
-                    K1 = rotate_intrinsics(K1, image1.shape, rot1)
-                    cam1_T_w = rotate_pose_inplane(cam1_T_w, rot1)
-                cam1_T_cam0 = cam1_T_w @ np.linalg.inv(cam0_T_w)
-                T_0to1 = cam1_T_cam0
+                # Update the intrinsics + extrinsics if EXIF rotation was found.
+                if rot0 != 0 or rot1 != 0:
+                    cam0_T_w = np.eye(4)
+                    cam1_T_w = T_0to1
+                    if rot0 != 0:
+                        K0 = rotate_intrinsics(K0, image0.shape, rot0)
+                        cam0_T_w = rotate_pose_inplane(cam0_T_w, rot0)
+                    if rot1 != 0:
+                        K1 = rotate_intrinsics(K1, image1.shape, rot1)
+                        cam1_T_w = rotate_pose_inplane(cam1_T_w, rot1)
+                    cam1_T_cam0 = cam1_T_w @ np.linalg.inv(cam0_T_w)
+                    T_0to1 = cam1_T_cam0
 
-            epi_errs = compute_epipolar_error(mkpts0, mkpts1, T_0to1, K0, K1)
-            correct = epi_errs < 5e-4
-            num_correct = np.sum(correct)
-            precision = np.mean(correct) if len(correct) > 0 else 0
-            matching_score = num_correct / len(kpts0) if len(kpts0) > 0 else 0
+                epi_errs = compute_epipolar_error(mkpts0, mkpts1, T_0to1, K0, K1)
+                correct = epi_errs < 5e-4
+                num_correct = np.sum(correct)
+                precision = np.mean(correct) if len(correct) > 0 else 0
+                matching_score = num_correct / len(kpts0) if len(kpts0) > 0 else 0
 
-            thresh = 1.  # In pixels relative to resized image size.
-            ret = estimate_pose(mkpts0, mkpts1, K0, K1, thresh)
-            if ret is None:
-                err_t, err_R = np.inf, np.inf
-            else:
-                R, t, inliers = ret
-                err_t, err_R = compute_pose_error(T_0to1, R, t)
+                thresh = 1.  # In pixels relative to resized image size.
+                ret = estimate_pose(mkpts0, mkpts1, K0, K1, thresh)
+                if ret is None:
+                    err_t, err_R = np.inf, np.inf
+                else:
+                    R, t, inliers = ret
+                    err_t, err_R = compute_pose_error(T_0to1, R, t)
 
-            # Write the evaluation results to disk.
-            out_eval = {'error_t': err_t,
-                        'error_R': err_R,
-                        'precision': precision,
-                        'matching_score': matching_score,
-                        'num_correct': num_correct,
-                        'epipolar_errors': epi_errs}
-            np.savez(str(eval_path), **out_eval)
-            timer.update('eval')
+                # Write the evaluation results to disk.
+                out_eval = {'error_t': err_t,
+                            'error_R': err_R,
+                            'precision': precision,
+                            'matching_score': matching_score,
+                            'num_correct': num_correct,
+                            'epipolar_errors': epi_errs}
+                np.savez(str(eval_path), **out_eval)
+                timer.update('eval')
 
-        if do_viz:
-            # Visualize the matches.
-            color = cm.jet(mconf)
-            text = [
-                'SuperGlue',
-                'Keypoints: {}:{}'.format(len(kpts0), len(kpts1)),
-                'Matches: {}'.format(len(mkpts0)),
-            ]
-            if rot0 != 0 or rot1 != 0:
-                text.append('Rotation: {}:{}'.format(rot0, rot1))
+            if do_viz:
+                # Visualize the matches.
+                color = cm.jet(mconf)
+                text = [
+                    'SuperGlue',
+                    'Keypoints: {}:{}'.format(len(kpts0), len(kpts1)),
+                    'Matches: {}'.format(len(mkpts0)),
+                ]
+                if rot0 != 0 or rot1 != 0:
+                    text.append('Rotation: {}:{}'.format(rot0, rot1))
 
-            # Display extra parameter info.
-            k_thresh = matching.superpoint.config['keypoint_threshold']
-            m_thresh = matching.superglue.config['match_threshold']
-            small_text = [
-                'Keypoint Threshold: {:.4f}'.format(k_thresh),
-                'Match Threshold: {:.2f}'.format(m_thresh),
-                'Image Pair: {}:{}'.format(stem0, stem1),
-            ]
+                # Display extra parameter info.
+                k_thresh = matching.superpoint.config['keypoint_threshold']
+                m_thresh = matching.superglue.config['match_threshold']
+                small_text = [
+                    'Keypoint Threshold: {:.4f}'.format(k_thresh),
+                    'Match Threshold: {:.2f}'.format(m_thresh),
+                    'Image Pair: {}:{}'.format(stem0, stem1),
+                ]
 
-            make_matching_plot(
-                image0, image1, kpts0, kpts1, mkpts0, mkpts1, color,
-                text, viz_path, opt.show_keypoints,
-                opt.fast_viz, opt.opencv_display, 'Matches', small_text)
+                make_matching_plot(
+                    image0, image1, kpts0, kpts1, mkpts0, mkpts1, color,
+                    text, viz_path, opt.show_keypoints,
+                    opt.fast_viz, opt.opencv_display, 'Matches', small_text)
 
-            timer.update('viz_match')
+                timer.update('viz_match')
 
-        if do_viz_eval:
-            # Visualize the evaluation results for the image pair.
-            color = np.clip((epi_errs - 0) / (1e-3 - 0), 0, 1)
-            color = error_colormap(1 - color)
-            deg, delta = ' deg', 'Delta '
-            if not opt.fast_viz:
-                deg, delta = '°', '$\\Delta$'
-            e_t = 'FAIL' if np.isinf(err_t) else '{:.1f}{}'.format(err_t, deg)
-            e_R = 'FAIL' if np.isinf(err_R) else '{:.1f}{}'.format(err_R, deg)
-            text = [
-                'SuperGlue',
-                '{}R: {}'.format(delta, e_R), '{}t: {}'.format(delta, e_t),
-                'inliers: {}/{}'.format(num_correct, (matches > -1).sum()),
-            ]
-            if rot0 != 0 or rot1 != 0:
-                text.append('Rotation: {}:{}'.format(rot0, rot1))
+            if do_viz_eval:
+                # Visualize the evaluation results for the image pair.
+                color = np.clip((epi_errs - 0) / (1e-3 - 0), 0, 1)
+                color = error_colormap(1 - color)
+                deg, delta = ' deg', 'Delta '
+                if not opt.fast_viz:
+                    deg, delta = '°', '$\\Delta$'
+                e_t = 'FAIL' if np.isinf(err_t) else '{:.1f}{}'.format(err_t, deg)
+                e_R = 'FAIL' if np.isinf(err_R) else '{:.1f}{}'.format(err_R, deg)
+                text = [
+                    'SuperGlue',
+                    '{}R: {}'.format(delta, e_R), '{}t: {}'.format(delta, e_t),
+                    'inliers: {}/{}'.format(num_correct, (matches > -1).sum()),
+                ]
+                if rot0 != 0 or rot1 != 0:
+                    text.append('Rotation: {}:{}'.format(rot0, rot1))
 
-            # Display extra parameter info (only works with --fast_viz).
-            k_thresh = matching.superpoint.config['keypoint_threshold']
-            m_thresh = matching.superglue.config['match_threshold']
-            small_text = [
-                'Keypoint Threshold: {:.4f}'.format(k_thresh),
-                'Match Threshold: {:.2f}'.format(m_thresh),
-                'Image Pair: {}:{}'.format(stem0, stem1),
-            ]
+                # Display extra parameter info (only works with --fast_viz).
+                k_thresh = matching.superpoint.config['keypoint_threshold']
+                m_thresh = matching.superglue.config['match_threshold']
+                small_text = [
+                    'Keypoint Threshold: {:.4f}'.format(k_thresh),
+                    'Match Threshold: {:.2f}'.format(m_thresh),
+                    'Image Pair: {}:{}'.format(stem0, stem1),
+                ]
 
-            make_matching_plot(
-                image0, image1, kpts0, kpts1, mkpts0,
-                mkpts1, color, text, viz_eval_path,
-                opt.show_keypoints, opt.fast_viz,
-                opt.opencv_display, 'Relative Pose', small_text)
+                make_matching_plot(
+                    image0, image1, kpts0, kpts1, mkpts0,
+                    mkpts1, color, text, viz_eval_path,
+                    opt.show_keypoints, opt.fast_viz,
+                    opt.opencv_display, 'Relative Pose', small_text)
 
-            timer.update('viz_eval')
+                timer.update('viz_eval')
 
-        timer.print('Finished pair {:5} of {:5}'.format(i, len(pairs)))
+            timer.print('Finished pair {:5} of {:5}'.format(i, len(pairs)))
 
     if opt.eval:
         # Collate the results into a final table and print to terminal.

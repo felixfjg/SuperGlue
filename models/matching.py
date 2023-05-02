@@ -76,9 +76,15 @@ class Matching(torch.nn.Module):
 
         for k in data:
             if isinstance(data[k], (list, tuple)):
-                data[k] = torch.stack(data[k])
+                # data[k] = torch.stack(data[k])
+                from torch.nn.utils.rnn import pad_sequence
+                if k.startswith('descriptor'):
+                    padded_data = pad_sequence([x.transpose(0, 1) for x in data[k]], batch_first=True)  # padding成相同的维度
+                    data[k] = padded_data.transpose(1, 2)
+                else:
+                    data[k] = pad_sequence(data[k], batch_first=True)
 
         # Perform the matching
-        pred = {**pred, **self.superglue(data)}
+        pred = {**data, **self.superglue(data)}
 
         return pred

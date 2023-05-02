@@ -257,7 +257,7 @@ def process_resize(w, h, resize):
 
 
 def frame2tensor(frame, device):
-    return torch.from_numpy(frame/255.).float()[None, None].to(device)
+    return torch.from_numpy(frame/255.).float()[None].to(device)
 
 
 def read_image(path, device, resize, rotation, resize_float):
